@@ -18,6 +18,7 @@ pub use open_listener::*;
 use anyhow::Context as _;
 use assets::Assets;
 use futures::{channel::mpsc, select_biased, StreamExt};
+use language::LanguageSource;
 use project::TaskSourceKind;
 use project_panel::ProjectPanel;
 use quick_action_bar::QuickActionBar;
@@ -29,7 +30,12 @@ use settings::{
     SettingsStore, DEFAULT_KEYMAP_PATH,
 };
 use std::{borrow::Cow, ops::Deref, path::Path, sync::Arc};
-use task::{oneshot_source::OneshotSource, static_source::StaticSource};
+use task::{
+    oneshot_source::OneshotSource,
+    static_source::{StaticSource, TrackedFile},
+};
+use theme::ActiveTheme;
+
 use terminal_view::terminal_panel::{self, TerminalPanel};
 use util::{
     asset_str,
@@ -90,7 +96,7 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut AppContext) -> 
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
-            traffic_light_position: Some(point(px(9.5), px(9.5))),
+            traffic_light_position: Some(point(px(9.0), px(9.0))),
         }),
         bounds: None,
         focus: false,
@@ -99,6 +105,7 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut AppContext) -> 
         is_movable: true,
         display_id: display.map(|display| display.id()),
         fullscreen: false,
+        window_background: cx.theme().window_background_appearance(),
     }
 }
 
@@ -166,8 +173,17 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut AppContext) {
                                 fs,
                                 paths::TASKS.clone(),
                             );
-                            StaticSource::new("global_tasks", tasks_file_rx, cx)
+                            StaticSource::new(
+                                "global_tasks",
+                                TrackedFile::new(tasks_file_rx, cx),
+                                cx,
+                            )
                         },
+                        cx,
+                    );
+                    inventory.add_source(
+                        TaskSourceKind::Buffer,
+                        |cx| LanguageSource::new(app_state.languages.clone(), cx),
                         cx,
                     );
                 })
@@ -634,12 +650,17 @@ fn reload_keymaps(cx: &mut AppContext, keymap_content: &KeymapFile) {
 }
 
 pub fn load_default_keymap(cx: &mut AppContext) {
+    let base_keymap = *BaseKeymap::get_global(cx);
+    if base_keymap == BaseKeymap::None {
+        return;
+    }
+
     KeymapFile::load_asset(DEFAULT_KEYMAP_PATH, cx).unwrap();
     if VimModeSetting::get_global(cx).0 {
         KeymapFile::load_asset("keymaps/vim.json", cx).unwrap();
     }
 
-    if let Some(asset_path) = BaseKeymap::get_global(cx).asset_path() {
+    if let Some(asset_path) = base_keymap.asset_path() {
         KeymapFile::load_asset(asset_path, cx).unwrap();
     }
 }
@@ -860,8 +881,8 @@ mod tests {
     use collections::HashSet;
     use editor::{scroll::Autoscroll, DisplayPoint, Editor};
     use gpui::{
-        actions, Action, AnyWindowHandle, AppContext, AssetSource, Entity, TestAppContext,
-        VisualTestContext, WindowHandle,
+        actions, Action, AnyWindowHandle, AppContext, AssetSource, BorrowAppContext, Entity,
+        TestAppContext, VisualTestContext, WindowHandle,
     };
     use language::{LanguageMatcher, LanguageRegistry};
     use project::{Project, ProjectPath, WorktreeSettings};
@@ -3054,6 +3075,7 @@ mod tests {
             notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
             workspace::init(app_state.clone(), cx);
             Project::init_settings(cx);
+            command_palette::init(cx);
             language::init(cx);
             editor::init(cx);
             project_panel::init_settings(cx);

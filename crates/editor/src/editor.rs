@@ -24,6 +24,7 @@ mod git;
 mod highlight_matching_bracket;
 mod hover_links;
 mod hover_popover;
+mod inline_completion_provider;
 pub mod items;
 mod mouse_context_menu;
 pub mod movement;
@@ -37,6 +38,7 @@ mod editor_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 use ::git::diff::{DiffHunk, DiffHunkStatus};
+use ::git::permalink::{build_permalink, BuildPermalinkParams};
 pub(crate) use actions::*;
 use aho_corasick::AhoCorasick;
 use anyhow::{anyhow, Context as _, Result};
@@ -45,7 +47,6 @@ use client::{Collaborator, ParticipantIndex};
 use clock::ReplicaId;
 use collections::{hash_map, BTreeMap, Bound, HashMap, HashSet, VecDeque};
 use convert_case::{Case, Casing};
-use copilot::Copilot;
 use debounced_delay::DebouncedDelay;
 pub use display_map::DisplayPoint;
 use display_map::*;
@@ -56,19 +57,22 @@ pub use element::{
 };
 use futures::FutureExt;
 use fuzzy::{StringMatch, StringMatchCandidate};
+use git::blame::GitBlame;
 use git::diff_hunk_to_display;
 use gpui::{
     div, impl_actions, point, prelude::*, px, relative, rems, size, uniform_list, Action,
-    AnyElement, AppContext, AsyncWindowContext, BackgroundExecutor, Bounds, ClipboardItem, Context,
-    DispatchPhase, ElementId, EventEmitter, FocusHandle, FocusableView, FontId, FontStyle,
-    FontWeight, HighlightStyle, Hsla, InteractiveText, KeyContext, Model, MouseButton,
-    ParentElement, Pixels, Render, SharedString, StrikethroughStyle, Styled, StyledText,
-    Subscription, Task, TextStyle, UnderlineStyle, UniformListScrollHandle, View, ViewContext,
-    ViewInputHandler, VisualContext, WeakView, WhiteSpace, WindowContext,
+    AnyElement, AppContext, AsyncWindowContext, AvailableSpace, BackgroundExecutor, Bounds,
+    ClipboardItem, Context, DispatchPhase, ElementId, EventEmitter, FocusHandle, FocusableView,
+    FontId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText, KeyContext, Model,
+    MouseButton, ParentElement, Pixels, Render, SharedString, Styled, StyledText, Subscription,
+    Task, TextStyle, UnderlineStyle, UniformListScrollHandle, View, ViewContext, ViewInputHandler,
+    VisualContext, WeakView, WhiteSpace, WindowContext,
 };
 use highlight_matching_bracket::refresh_matching_bracket_highlights;
+use hover_links::{HoverLink, HoveredLinkState, InlayHighlight};
 use hover_popover::{hide_hover, HoverState};
 use inlay_hint_cache::{InlayHintCache, InlaySplice, InvalidationStrategy};
+pub use inline_completion_provider::*;
 pub use items::MAX_TAB_TITLE_LEN;
 use itertools::Itertools;
 use language::{char_kind, CharKind};
@@ -78,8 +82,6 @@ use language::{
     CodeLabel, Completion, CursorShape, Diagnostic, Documentation, IndentKind, IndentSize,
     Language, OffsetRangeExt, Point, Selection, SelectionGoal, TransactionId,
 };
-
-use hover_links::{HoverLink, HoveredLinkState, InlayHighlight};
 use lsp::{DiagnosticSeverity, LanguageServerId};
 use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
@@ -91,8 +93,7 @@ pub use multi_buffer::{
 use ordered_float::OrderedFloat;
 use parking_lot::{Mutex, RwLock};
 use project::project_settings::{GitGutterSetting, ProjectSettings};
-use project::Item;
-use project::{FormatTrigger, Location, Project, ProjectPath, ProjectTransaction};
+use project::{FormatTrigger, Item, Location, Project, ProjectPath, ProjectTransaction};
 use rand::prelude::*;
 use rpc::proto::*;
 use scroll::{Autoscroll, OngoingScroll, ScrollAnchor, ScrollManager, ScrollbarAutoHide};
@@ -135,7 +136,6 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_LINE_LEN: usize = 1024;
 const MIN_NAVIGATION_HISTORY_ROW_DELTA: i64 = 10;
 const MAX_SELECTION_HISTORY_LEN: usize = 1024;
-const COPILOT_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(75);
 pub(crate) const CURSORS_VISIBLE_FOR: Duration = Duration::from_millis(2000);
 #[doc(hidden)]
 pub const CODE_ACTIONS_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -419,7 +419,9 @@ pub struct Editor {
     hover_state: HoverState,
     gutter_hovered: bool,
     hovered_link_state: Option<HoveredLinkState>,
-    copilot_state: CopilotState,
+    inline_completion_provider: Option<RegisteredInlineCompletionProvider>,
+    active_inline_completion: Option<Inlay>,
+    show_inline_completions: bool,
     inlay_hint_cache: InlayHintCache,
     next_inlay_id: usize,
     _subscriptions: Vec<Subscription>,
@@ -428,9 +430,11 @@ pub struct Editor {
     pub vim_replace_map: HashMap<Range<usize>, String>,
     style: Option<EditorStyle>,
     editor_actions: Vec<Box<dyn Fn(&mut ViewContext<Self>)>>,
-    show_copilot_suggestions: bool,
     use_autoclose: bool,
     auto_replace_emoji_shortcode: bool,
+    show_git_blame: bool,
+    blame: Option<Model<GitBlame>>,
+    blame_subscription: Option<Subscription>,
     custom_context_menu: Option<
         Box<
             dyn 'static
@@ -442,6 +446,7 @@ pub struct Editor {
 pub struct EditorSnapshot {
     pub mode: EditorMode,
     show_gutter: bool,
+    show_git_blame: bool,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_text: Option<Arc<str>>,
     is_focused: bool,
@@ -449,11 +454,14 @@ pub struct EditorSnapshot {
     ongoing_scroll: OngoingScroll,
 }
 
+const GIT_BLAME_GUTTER_WIDTH_CHARS: f32 = 53.;
+
 pub struct GutterDimensions {
     pub left_padding: Pixels,
     pub right_padding: Pixels,
     pub width: Pixels,
     pub margin: Pixels,
+    pub git_blame_entries_width: Option<Pixels>,
 }
 
 impl Default for GutterDimensions {
@@ -463,6 +471,7 @@ impl Default for GutterDimensions {
             right_padding: Pixels::ZERO,
             width: Pixels::ZERO,
             margin: Pixels::ZERO,
+            git_blame_entries_width: None,
         }
     }
 }
@@ -624,6 +633,11 @@ pub struct RenameState {
 }
 
 struct InvalidationStack<T>(Vec<T>);
+
+struct RegisteredInlineCompletionProvider {
+    provider: Arc<dyn InlineCompletionProviderHandle>,
+    _subscription: Subscription,
+}
 
 enum ContextMenu {
     Completions(CompletionsMenu),
@@ -846,25 +860,41 @@ impl CompletionsMenu {
         let settings = EditorSettings::get_global(cx);
         let show_completion_documentation = settings.show_completion_documentation;
 
-        let widest_completion_ix = self
+        let font_size = style.text.font_size.to_pixels(cx.rem_size());
+        let padding_width = cx.rem_size().0 / 16. * 36.;
+
+        let max_completion_len = px(510.);
+        let widest_completion_pixels = self
             .matches
             .iter()
-            .enumerate()
-            .max_by_key(|(_, mat)| {
+            .map(|mat| {
                 let completions = self.completions.read();
                 let completion = &completions[mat.candidate_id];
                 let documentation = &completion.documentation;
 
-                let mut len = completion.label.text.chars().count();
-                if let Some(Documentation::SingleLine(text)) = documentation {
-                    if show_completion_documentation {
-                        len += text.chars().count();
-                    }
+                let mut len = completion.label.text.chars().count() as f32;
+                if let Ok(text_width) = cx.text_system().layout_line(
+                    completion.label.text.as_str(),
+                    font_size,
+                    &[style.text.to_run(completion.label.text.as_str().len())],
+                ) {
+                    len = text_width.width.0;
                 }
 
-                len
+                if let Some(Documentation::SingleLine(documentation_text)) = documentation {
+                    if show_completion_documentation {
+                        if let Ok(documentation_width) = cx.text_system().layout_line(
+                            documentation_text.as_str(),
+                            font_size,
+                            &[style.text.to_run(documentation_text.as_str().len())],
+                        ) {
+                            len = documentation_width.width.0 + padding_width;
+                        }
+                    }
+                }
+                (len + padding_width).min(max_completion_len.0 as f32)
             })
-            .map(|(ix, _)| ix);
+            .fold(190_f32, |a, b| a.max(b));
 
         let completions = self.completions.clone();
         let matches = self.matches.clone();
@@ -898,9 +928,7 @@ impl CompletionsMenu {
                     .max_w(px(640.))
                     .w(px(500.))
                     .overflow_y_scroll()
-                    // Prevent a mouse down on documentation from being propagated to the editor,
-                    // because that would move the cursor.
-                    .on_mouse_down(MouseButton::Left, |_, cx| cx.stop_propagation())
+                    .occlude()
             })
         } else {
             None
@@ -920,7 +948,7 @@ impl CompletionsMenu {
                     .map(|(ix, mat)| {
                         let item_ix = start_ix + ix;
                         let candidate_id = mat.candidate_id;
-                        let completion = &completions_guard[candidate_id];
+                        let completion = completions_guard[candidate_id].clone();
 
                         let documentation = if show_completion_documentation {
                             &completion.documentation
@@ -928,70 +956,44 @@ impl CompletionsMenu {
                             &None
                         };
 
-                        let highlights = gpui::combine_highlights(
-                            mat.ranges().map(|range| (range, FontWeight::BOLD.into())),
-                            styled_runs_for_code_label(&completion.label, &style.syntax).map(
-                                |(range, mut highlight)| {
-                                    // Ignore font weight for syntax highlighting, as we'll use it
-                                    // for fuzzy matches.
-                                    highlight.font_weight = None;
-
-                                    if completion.lsp_completion.deprecated.unwrap_or(false) {
-                                        highlight.strikethrough = Some(StrikethroughStyle {
-                                            thickness: 1.0.into(),
-                                            ..Default::default()
-                                        });
-                                        highlight.color = Some(cx.theme().colors().text_muted);
-                                    }
-
-                                    (range, highlight)
-                                },
-                            ),
-                        );
-                        let completion_label = StyledText::new(completion.label.text.clone())
-                            .with_highlights(&style.text, highlights);
-                        let documentation_label =
-                            if let Some(Documentation::SingleLine(text)) = documentation {
-                                if text.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(
-                                        h_flex().ml_4().child(
-                                            Label::new(text.clone())
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        ),
-                                    )
-                                }
-                            } else {
-                                None
-                            };
-
-                        div().min_w(px(220.)).max_w(px(540.)).child(
-                            ListItem::new(mat.candidate_id)
-                                .inset(true)
-                                .selected(item_ix == selected_item)
-                                .on_click(cx.listener(move |editor, _event, cx| {
-                                    cx.stop_propagation();
-                                    if let Some(task) = editor.confirm_completion(
-                                        &ConfirmCompletion {
-                                            item_ix: Some(item_ix),
-                                        },
-                                        cx,
-                                    ) {
-                                        task.detach_and_log_err(cx)
-                                    }
-                                }))
-                                .child(h_flex().overflow_hidden().child(completion_label))
-                                .end_slot::<Div>(documentation_label),
-                        )
+                        let (_completion_width, completion_label, documentation_label) =
+                            Self::truncate_completion(
+                                &style,
+                                cx,
+                                mat,
+                                &mut completion.clone(),
+                                documentation,
+                                max_completion_len,
+                            );
+                        div()
+                            .min_w(px(widest_completion_pixels + padding_width))
+                            .max_w(max_completion_len + px(padding_width))
+                            .child(
+                                ListItem::new(mat.candidate_id)
+                                    .inset(true)
+                                    .selected(item_ix == selected_item)
+                                    .on_click(cx.listener(move |editor, _event, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(task) = editor.confirm_completion(
+                                            &ConfirmCompletion {
+                                                item_ix: Some(item_ix),
+                                            },
+                                            cx,
+                                        ) {
+                                            task.detach_and_log_err(cx)
+                                        }
+                                    }))
+                                    .child(h_flex().overflow_hidden().child(completion_label))
+                                    .end_slot(documentation_label),
+                            )
                     })
                     .collect()
             },
         )
+        .occlude()
         .max_h(max_height)
         .track_scroll(self.scroll_handle.clone())
-        .with_width_from_item(widest_completion_ix);
+        .min_w(px(widest_completion_pixels + padding_width));
 
         Popover::new()
             .child(list)
@@ -999,6 +1001,294 @@ impl CompletionsMenu {
                 popover.aside(multiline_docs)
             })
             .into_any_element()
+    }
+
+    fn truncate_completion(
+        style: &EditorStyle,
+        cx: &mut ViewContext<Editor>,
+        mat: &StringMatch,
+        completion: &mut Completion,
+        documentation: &Option<Documentation>,
+        max_completion_len: Pixels,
+    ) -> (Pixels, StyledText, StyledText) {
+        let highlights = gpui::combine_highlights(
+            mat.ranges().map(|range| (range, FontWeight::BOLD.into())),
+            styled_runs_for_code_label(&completion.label, &style.syntax).map(
+                |(range, mut highlight)| {
+                    // Ignore font weight for syntax highlighting, as we'll use it
+                    // for fuzzy matches.
+                    highlight.font_weight = None;
+                    (range, highlight)
+                },
+            ),
+        );
+
+        let mut inline_documentation_exists = false;
+
+        let mut documentation_text = if let Some(Documentation::SingleLine(text)) = documentation {
+            inline_documentation_exists = true;
+            text
+        } else {
+            ""
+        }
+        .to_owned();
+        let documentation_style = style.clone().text;
+
+        let documentation_highlight_style = HighlightStyle {
+            color: Some(Color::Muted.color(cx)),
+            ..Default::default()
+        };
+
+        let documentation_highlights = vec![(
+            Range {
+                start: 0,
+                end: documentation_text.len(),
+            },
+            documentation_highlight_style,
+        )];
+        let documentation_label = StyledText::new(documentation_text.clone())
+            .with_highlights(&documentation_style, documentation_highlights);
+
+        let mut completion_label =
+            StyledText::new(completion.label.text.clone()).with_highlights(&style.text, highlights);
+
+        let font_size = style.text.font_size.to_pixels(cx.rem_size());
+
+        let mut variable_name_end = completion.label.filter_range.end;
+        let mut completion_label_text = completion.label.text.clone();
+        let mut variable_name_length_truncated: i32 = 0;
+
+        let mut actual_width: Pixels = px(0.);
+        if let Ok(ellipsis_width) =
+            cx.text_system()
+                .layout_line("…", font_size, &[style.text.to_run("…".len())])
+        {
+            if let Ok(completion_layout_line) = completion_label.layout_line(font_size, cx) {
+                if let Ok(documentation_layout_line) =
+                    documentation_label.layout_line(font_size, cx)
+                {
+                    if inline_documentation_exists {
+                        if completion_layout_line.width + documentation_layout_line.width
+                            > max_completion_len
+                        {
+                            actual_width = max_completion_len;
+                            let width_of_variable_name = completion_layout_line
+                                .x_for_index(completion.label.filter_range.end);
+                            let width_of_documentation =
+                                documentation_layout_line.x_for_index(documentation_text.len());
+
+                            let max_width_of_variable_name =
+                                if width_of_documentation < max_completion_len * 0.2 {
+                                    max_completion_len - width_of_documentation
+                                } else {
+                                    max_completion_len * 0.8
+                                };
+
+                            if width_of_variable_name < max_width_of_variable_name {
+                                // Only truncate the second part.
+                                if let Some(documentation_truncation_index) =
+                                    documentation_layout_line.index_for_x(
+                                        (max_completion_len * 0.65).min(
+                                            max_completion_len
+                                                - ellipsis_width.width
+                                                - width_of_variable_name,
+                                        ),
+                                    )
+                                {
+                                    variable_name_end = documentation_truncation_index + 2;
+                                    documentation_text = documentation_text
+                                        .chars()
+                                        .take(documentation_truncation_index)
+                                        .collect::<String>()
+                                        + "…";
+                                }
+                            } else {
+                                // Truncate the first part (and optionally the second part).
+                                if let Some(variable_name_truncation_index) = completion_layout_line
+                                    .index_for_x(max_width_of_variable_name - ellipsis_width.width)
+                                {
+                                    variable_name_end = variable_name_truncation_index + 2;
+                                    variable_name_length_truncated =
+                                        completion.label.filter_range.end as i32
+                                            - variable_name_end as i32
+                                            - 1;
+                                    completion_label_text = completion
+                                        .label
+                                        .text
+                                        .chars()
+                                        .take(variable_name_truncation_index)
+                                        .collect::<String>()
+                                        + "…";
+                                    completion_label =
+                                        completion_label.with_text(completion_label_text.clone());
+                                    if let Ok(new_completion_layout_line) =
+                                        completion_label.layout_line(font_size, cx)
+                                    {
+                                        let combined_width = new_completion_layout_line
+                                            .x_for_index(completion_label_text.len())
+                                            + width_of_documentation;
+                                        if combined_width > max_completion_len {
+                                            if let Some(documentation_truncation_index) =
+                                                documentation_layout_line.index_for_x(
+                                                    (max_completion_len * 0.65).min(
+                                                        max_completion_len
+                                                            - ellipsis_width.width
+                                                            - max_width_of_variable_name,
+                                                    ),
+                                                )
+                                            {
+                                                documentation_text = documentation_text
+                                                    .chars()
+                                                    .take(documentation_truncation_index)
+                                                    .collect::<String>()
+                                                    + "…";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            actual_width =
+                                completion_layout_line.width + documentation_layout_line.width;
+                        }
+                    } else {
+                        if completion_layout_line.width > max_completion_len {
+                            actual_width = max_completion_len;
+                            let width_of_variable_name = completion_layout_line
+                                .x_for_index(completion.label.filter_range.end);
+                            let width_of_type_annotation =
+                                completion_layout_line.width - width_of_variable_name;
+
+                            let max_width_of_variable_name =
+                                if width_of_type_annotation < max_completion_len * 0.2 {
+                                    max_completion_len - width_of_type_annotation
+                                } else {
+                                    max_completion_len * 0.8
+                                };
+
+                            if width_of_variable_name < max_width_of_variable_name {
+                                // Only truncate the second part.
+
+                                if let Some(type_annotation_truncation_index) =
+                                    completion_layout_line
+                                        .index_for_x(max_completion_len - ellipsis_width.width)
+                                {
+                                    completion_label_text = completion
+                                        .label
+                                        .text
+                                        .chars()
+                                        .take(type_annotation_truncation_index)
+                                        .collect::<String>()
+                                        + "…";
+                                }
+                            } else {
+                                // Truncate the first part (and optionally the second part).
+                                if let Some(variable_name_truncation_index) = completion_layout_line
+                                    .index_for_x(max_width_of_variable_name - ellipsis_width.width)
+                                {
+                                    variable_name_end = variable_name_truncation_index + 2;
+
+                                    variable_name_length_truncated =
+                                        completion.label.filter_range.end as i32
+                                            - variable_name_end as i32
+                                            - 1;
+
+                                    let second_part_text = &completion.label.text.as_str()
+                                        [completion.label.filter_range.end..];
+
+                                    completion_label_text = completion
+                                        .label
+                                        .text
+                                        .chars()
+                                        .take(variable_name_truncation_index)
+                                        .collect::<String>()
+                                        + "…"
+                                        + second_part_text;
+                                    completion_label =
+                                        completion_label.with_text(completion_label_text.clone());
+
+                                    if let Ok(layout_line) =
+                                        completion_label.layout_line(font_size, cx)
+                                    {
+                                        let combined_width =
+                                            layout_line.x_for_index(completion_label_text.len());
+                                        if combined_width > max_completion_len {
+                                            if let Some(type_annotation_truncation_index) =
+                                                layout_line.index_for_x(
+                                                    max_completion_len - ellipsis_width.width,
+                                                )
+                                            {
+                                                completion_label_text = completion_label_text
+                                                    .chars()
+                                                    .take(type_annotation_truncation_index - 2)
+                                                    .collect::<String>()
+                                                    + "…";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            actual_width = completion_layout_line.width;
+                        }
+                    }
+                }
+            }
+        };
+
+        // Recompute syntax highlighting.
+        completion.label.text = completion_label_text.clone();
+        if inline_documentation_exists {
+            completion.label.filter_range.end = completion_label_text.len();
+            for run in completion.label.runs.iter_mut() {
+                if run.0.start == 0 {
+                    run.0.start = 0;
+                    run.0.end = completion_label_text.len();
+                }
+            }
+        } else {
+            completion.label.filter_range.end = variable_name_end;
+            for run in completion.label.runs.iter_mut() {
+                if run.0.start == 0 {
+                    run.0.start = 0;
+                    run.0.end = variable_name_end;
+                } else {
+                    run.0.start = (run.0.start as i32 - variable_name_length_truncated) as usize;
+                    run.0.end = (run.0.end as i32 - variable_name_length_truncated) as usize;
+                }
+            }
+        }
+        let highlights = gpui::combine_highlights(
+            mat.ranges().map(|range| (range, FontWeight::NORMAL.into())),
+            styled_runs_for_code_label(&completion.label, &style.syntax).map(
+                |(range, mut highlight)| {
+                    // Ignore font weight for syntax highlighting, as we'll use it
+                    // for fuzzy matches.
+                    highlight.font_weight = None;
+                    (range, highlight)
+                },
+            ),
+        );
+
+        let completion_label =
+            StyledText::new(completion_label_text).with_highlights(&style.text, highlights);
+
+        let documentation_style = style.clone().text;
+        let documentation_highlight_style = HighlightStyle {
+            color: Some(Color::Muted.color(cx)),
+            ..Default::default()
+        };
+        let documentation_highlights = vec![(
+            Range {
+                start: 0,
+                end: documentation_text.len(),
+            },
+            documentation_highlight_style,
+        )];
+
+        let documentation_label = StyledText::new(documentation_text)
+            .with_highlights(&documentation_style, documentation_highlights);
+        (actual_width, completion_label, documentation_label)
     }
 
     pub async fn filter(&mut self, query: Option<&str>, executor: BackgroundExecutor) {
@@ -1212,6 +1502,7 @@ impl CodeActionsMenu {
         .px_2()
         .py_1()
         .max_h(max_height)
+        .occlude()
         .track_scroll(self.scroll_handle.clone())
         .with_width_from_item(
             self.actions
@@ -1227,116 +1518,6 @@ impl CodeActionsMenu {
         }
 
         (cursor_position, element)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct CopilotState {
-    excerpt_id: Option<ExcerptId>,
-    pending_refresh: Task<Option<()>>,
-    pending_cycling_refresh: Task<Option<()>>,
-    cycled: bool,
-    completions: Vec<copilot::Completion>,
-    active_completion_index: usize,
-    suggestion: Option<Inlay>,
-}
-
-impl Default for CopilotState {
-    fn default() -> Self {
-        Self {
-            excerpt_id: None,
-            pending_cycling_refresh: Task::ready(Some(())),
-            pending_refresh: Task::ready(Some(())),
-            completions: Default::default(),
-            active_completion_index: 0,
-            cycled: false,
-            suggestion: None,
-        }
-    }
-}
-
-impl CopilotState {
-    fn active_completion(&self) -> Option<&copilot::Completion> {
-        self.completions.get(self.active_completion_index)
-    }
-
-    fn text_for_active_completion(
-        &self,
-        cursor: Anchor,
-        buffer: &MultiBufferSnapshot,
-    ) -> Option<&str> {
-        use language::ToOffset as _;
-
-        let completion = self.active_completion()?;
-        let excerpt_id = self.excerpt_id?;
-        let completion_buffer = buffer.buffer_for_excerpt(excerpt_id)?;
-        if excerpt_id != cursor.excerpt_id
-            || !completion.range.start.is_valid(completion_buffer)
-            || !completion.range.end.is_valid(completion_buffer)
-        {
-            return None;
-        }
-
-        let mut completion_range = completion.range.to_offset(&completion_buffer);
-        let prefix_len = Self::common_prefix(
-            completion_buffer.chars_for_range(completion_range.clone()),
-            completion.text.chars(),
-        );
-        completion_range.start += prefix_len;
-        let suffix_len = Self::common_prefix(
-            completion_buffer.reversed_chars_for_range(completion_range.clone()),
-            completion.text[prefix_len..].chars().rev(),
-        );
-        completion_range.end = completion_range.end.saturating_sub(suffix_len);
-
-        if completion_range.is_empty()
-            && completion_range.start == cursor.text_anchor.to_offset(&completion_buffer)
-        {
-            let completion_text = &completion.text[prefix_len..completion.text.len() - suffix_len];
-            if completion_text.trim().is_empty() {
-                None
-            } else {
-                Some(completion_text)
-            }
-        } else {
-            None
-        }
-    }
-
-    fn cycle_completions(&mut self, direction: Direction) {
-        match direction {
-            Direction::Prev => {
-                self.active_completion_index = if self.active_completion_index == 0 {
-                    self.completions.len().saturating_sub(1)
-                } else {
-                    self.active_completion_index - 1
-                };
-            }
-            Direction::Next => {
-                if self.completions.len() == 0 {
-                    self.active_completion_index = 0
-                } else {
-                    self.active_completion_index =
-                        (self.active_completion_index + 1) % self.completions.len();
-                }
-            }
-        }
-    }
-
-    fn push_completion(&mut self, new_completion: copilot::Completion) {
-        for completion in &self.completions {
-            if completion.text == new_completion.text && completion.range == new_completion.range {
-                return;
-            }
-        }
-        self.completions.push(new_completion);
-    }
-
-    fn common_prefix<T1: Iterator<Item = char>, T2: Iterator<Item = char>>(a: T1, b: T2) -> usize {
-        a.zip(b)
-            .take_while(|(a, b)| a == b)
-            .map(|(a, _)| a.len_utf8())
-            .sum()
     }
 }
 
@@ -1562,7 +1743,8 @@ impl Editor {
             remote_id: None,
             hover_state: Default::default(),
             hovered_link_state: Default::default(),
-            copilot_state: Default::default(),
+            inline_completion_provider: None,
+            active_inline_completion: None,
             inlay_hint_cache: InlayHintCache::new(inlay_hint_settings),
             gutter_hovered: false,
             pixel_position_of_newest_cursor: None,
@@ -1572,8 +1754,11 @@ impl Editor {
             hovered_cursors: Default::default(),
             editor_actions: Default::default(),
             vim_replace_map: Default::default(),
-            show_copilot_suggestions: mode == EditorMode::Full,
+            show_inline_completions: mode == EditorMode::Full,
             custom_context_menu: None,
+            show_git_blame: false,
+            blame: None,
+            blame_subscription: None,
             _subscriptions: vec![
                 cx.observe(&buffer, Self::on_buffer_changed),
                 cx.subscribe(&buffer, Self::on_buffer_event),
@@ -1648,8 +1833,9 @@ impl Editor {
             key_context.set("extension", extension.to_string());
         }
 
-        if self.has_active_copilot_suggestion(cx) {
+        if self.has_active_inline_completion(cx) {
             key_context.add("copilot_suggestion");
+            key_context.add("inline_completion");
         }
 
         key_context
@@ -1718,6 +1904,10 @@ impl Editor {
         EditorSnapshot {
             mode: self.mode,
             show_gutter: self.show_gutter,
+            show_git_blame: self
+                .blame
+                .as_ref()
+                .map_or(false, |blame| blame.read(cx).has_generated_entries()),
             display_snapshot: self.display_map.update(cx, |map, cx| map.snapshot(cx)),
             scroll_anchor: self.scroll_manager.anchor(),
             ongoing_scroll: self.scroll_manager.ongoing_scroll(),
@@ -1769,6 +1959,22 @@ impl Editor {
 
     pub fn set_completion_provider(&mut self, hub: Box<dyn CompletionProvider>) {
         self.completion_provider = Some(hub);
+    }
+
+    pub fn set_inline_completion_provider(
+        &mut self,
+        provider: Model<impl InlineCompletionProvider>,
+        cx: &mut ViewContext<Self>,
+    ) {
+        self.inline_completion_provider = Some(RegisteredInlineCompletionProvider {
+            _subscription: cx.observe(&provider, |this, _, cx| {
+                if this.focus_handle.is_focused(cx) {
+                    this.update_visible_inline_completion(cx);
+                }
+            }),
+            provider: Arc::new(provider),
+        });
+        self.refresh_inline_completion(false, cx);
     }
 
     pub fn placeholder_text(&self, _cx: &mut WindowContext) -> Option<&str> {
@@ -1853,8 +2059,8 @@ impl Editor {
         self.auto_replace_emoji_shortcode = auto_replace;
     }
 
-    pub fn set_show_copilot_suggestions(&mut self, show_copilot_suggestions: bool) {
-        self.show_copilot_suggestions = show_copilot_suggestions;
+    pub fn set_show_inline_completions(&mut self, show_inline_completions: bool) {
+        self.show_inline_completions = show_inline_completions;
     }
 
     pub fn set_use_modal_editing(&mut self, to: bool) {
@@ -1966,7 +2172,7 @@ impl Editor {
             self.refresh_code_actions(cx);
             self.refresh_document_highlights(cx);
             refresh_matching_bracket_highlights(self, cx);
-            self.discard_copilot_suggestion(cx);
+            self.discard_inline_completion(cx);
         }
 
         self.blink_manager.update(cx, BlinkManager::pause_blinking);
@@ -2392,7 +2598,7 @@ impl Editor {
             return true;
         }
 
-        if self.discard_copilot_suggestion(cx) {
+        if self.discard_inline_completion(cx) {
             return true;
         }
 
@@ -2647,7 +2853,7 @@ impl Editor {
             }
 
             drop(snapshot);
-            let had_active_copilot_suggestion = this.has_active_copilot_suggestion(cx);
+            let had_active_copilot_completion = this.has_active_inline_completion(cx);
             this.change_selections(Some(Autoscroll::fit()), cx, |s| s.select(new_selections));
 
             if brace_inserted {
@@ -2663,14 +2869,14 @@ impl Editor {
                 }
             }
 
-            if had_active_copilot_suggestion {
-                this.refresh_copilot_suggestions(true, cx);
-                if !this.has_active_copilot_suggestion(cx) {
+            if had_active_copilot_completion {
+                this.refresh_inline_completion(true, cx);
+                if !this.has_active_inline_completion(cx) {
                     this.trigger_completion_on_input(&text, cx);
                 }
             } else {
                 this.trigger_completion_on_input(&text, cx);
-                this.refresh_copilot_suggestions(true, cx);
+                this.refresh_inline_completion(true, cx);
             }
         });
     }
@@ -2856,7 +3062,7 @@ impl Editor {
                 .collect();
 
             this.change_selections(Some(Autoscroll::fit()), cx, |s| s.select(new_selections));
-            this.refresh_copilot_suggestions(true, cx);
+            this.refresh_inline_completion(true, cx);
         });
     }
 
@@ -3372,7 +3578,7 @@ impl Editor {
             .text_anchor_for_position(position, cx)?;
 
         // OnTypeFormatting returns a list of edits, no need to pass them between Zed instances,
-        // hence we do LSP request & edit on host side only — add formats to host's history.
+        // hence we do LSP request & edit on host side only — add formats to host's history.
         let push_to_lsp_host_history = true;
         // If this is not the host, append its history with new edits.
         let push_to_client_history = project.read(cx).is_remote();
@@ -3503,15 +3709,15 @@ impl Editor {
                         let menu = menu.unwrap();
                         *context_menu = Some(ContextMenu::Completions(menu));
                         drop(context_menu);
-                        this.discard_copilot_suggestion(cx);
+                        this.discard_inline_completion(cx);
                         cx.notify();
                     } else if this.completion_tasks.len() <= 1 {
                         // If there are no more completion tasks and the last menu was
                         // empty, we should hide it. If it was already hidden, we should
-                        // also show the copilot suggestion when available.
+                        // also show the copilot completion when available.
                         drop(context_menu);
                         if this.hide_context_menu(cx).is_none() {
-                            this.update_visible_copilot_suggestion(cx);
+                            this.update_visible_inline_completion(cx);
                         }
                     }
                 })?;
@@ -3637,7 +3843,7 @@ impl Editor {
                 });
             }
 
-            this.refresh_copilot_suggestions(true, cx);
+            this.refresh_inline_completion(true, cx);
         });
 
         let provider = self.completion_provider.as_ref()?;
@@ -3674,7 +3880,7 @@ impl Editor {
                 if this.focus_handle.is_focused(cx) {
                     if let Some((buffer, actions)) = this.available_code_actions.clone() {
                         this.completion_tasks.clear();
-                        this.discard_copilot_suggestion(cx);
+                        this.discard_inline_completion(cx);
                         *this.context_menu.write() =
                             Some(ContextMenu::CodeActions(CodeActionsMenu {
                                 buffer,
@@ -3828,19 +4034,17 @@ impl Editor {
             let actions = if let Ok(code_actions) = project.update(&mut cx, |project, cx| {
                 project.code_actions(&start_buffer, start..end, cx)
             }) {
-                code_actions.await.log_err()
+                code_actions.await
             } else {
-                None
+                Vec::new()
             };
 
             this.update(&mut cx, |this, cx| {
-                this.available_code_actions = actions.and_then(|actions| {
-                    if actions.is_empty() {
-                        None
-                    } else {
-                        Some((start_buffer, actions.into()))
-                    }
-                });
+                this.available_code_actions = if actions.is_empty() {
+                    None
+                } else {
+                    Some((start_buffer, actions.into()))
+                };
                 cx.notify();
             })
             .log_err();
@@ -3949,115 +4153,55 @@ impl Editor {
         None
     }
 
-    fn refresh_copilot_suggestions(
+    fn refresh_inline_completion(
         &mut self,
         debounce: bool,
         cx: &mut ViewContext<Self>,
     ) -> Option<()> {
-        let copilot = Copilot::global(cx)?;
-        if !self.show_copilot_suggestions || !copilot.read(cx).status().is_authorized() {
-            self.clear_copilot_suggestions(cx);
-            return None;
-        }
-        self.update_visible_copilot_suggestion(cx);
-
-        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let provider = self.inline_completion_provider()?;
         let cursor = self.selections.newest_anchor().head();
-        if !self.is_copilot_enabled_at(cursor, &snapshot, cx) {
-            self.clear_copilot_suggestions(cx);
+        let (buffer, cursor_buffer_position) =
+            self.buffer.read(cx).text_anchor_for_position(cursor, cx)?;
+        if !self.show_inline_completions
+            || !provider.is_enabled(&buffer, cursor_buffer_position, cx)
+        {
+            self.clear_inline_completion(cx);
             return None;
         }
 
-        let (buffer, buffer_position) =
-            self.buffer.read(cx).text_anchor_for_position(cursor, cx)?;
-        self.copilot_state.pending_refresh = cx.spawn(|this, mut cx| async move {
-            if debounce {
-                cx.background_executor()
-                    .timer(COPILOT_DEBOUNCE_TIMEOUT)
-                    .await;
-            }
-
-            let completions = copilot
-                .update(&mut cx, |copilot, cx| {
-                    copilot.completions(&buffer, buffer_position, cx)
-                })
-                .log_err()
-                .unwrap_or(Task::ready(Ok(Vec::new())))
-                .await
-                .log_err()
-                .into_iter()
-                .flatten()
-                .collect_vec();
-
-            this.update(&mut cx, |this, cx| {
-                if !completions.is_empty() {
-                    this.copilot_state.cycled = false;
-                    this.copilot_state.pending_cycling_refresh = Task::ready(None);
-                    this.copilot_state.completions.clear();
-                    this.copilot_state.active_completion_index = 0;
-                    this.copilot_state.excerpt_id = Some(cursor.excerpt_id);
-                    for completion in completions {
-                        this.copilot_state.push_completion(completion);
-                    }
-                    this.update_visible_copilot_suggestion(cx);
-                }
-            })
-            .log_err()?;
-            Some(())
-        });
-
+        self.update_visible_inline_completion(cx);
+        provider.refresh(buffer, cursor_buffer_position, debounce, cx);
         Some(())
     }
 
-    fn cycle_copilot_suggestions(
+    fn cycle_inline_completion(
         &mut self,
         direction: Direction,
         cx: &mut ViewContext<Self>,
     ) -> Option<()> {
-        let copilot = Copilot::global(cx)?;
-        if !self.show_copilot_suggestions || !copilot.read(cx).status().is_authorized() {
+        let provider = self.inline_completion_provider()?;
+        let cursor = self.selections.newest_anchor().head();
+        let (buffer, cursor_buffer_position) =
+            self.buffer.read(cx).text_anchor_for_position(cursor, cx)?;
+        if !self.show_inline_completions
+            || !provider.is_enabled(&buffer, cursor_buffer_position, cx)
+        {
             return None;
         }
 
-        if self.copilot_state.cycled {
-            self.copilot_state.cycle_completions(direction);
-            self.update_visible_copilot_suggestion(cx);
-        } else {
-            let cursor = self.selections.newest_anchor().head();
-            let (buffer, buffer_position) =
-                self.buffer.read(cx).text_anchor_for_position(cursor, cx)?;
-            self.copilot_state.pending_cycling_refresh = cx.spawn(|this, mut cx| async move {
-                let completions = copilot
-                    .update(&mut cx, |copilot, cx| {
-                        copilot.completions_cycling(&buffer, buffer_position, cx)
-                    })
-                    .log_err()?
-                    .await;
-
-                this.update(&mut cx, |this, cx| {
-                    this.copilot_state.cycled = true;
-                    for completion in completions.log_err().into_iter().flatten() {
-                        this.copilot_state.push_completion(completion);
-                    }
-                    this.copilot_state.cycle_completions(direction);
-                    this.update_visible_copilot_suggestion(cx);
-                })
-                .log_err()?;
-
-                Some(())
-            });
-        }
+        provider.cycle(buffer, cursor_buffer_position, direction, cx);
+        self.update_visible_inline_completion(cx);
 
         Some(())
     }
 
-    fn copilot_suggest(&mut self, _: &copilot::Suggest, cx: &mut ViewContext<Self>) {
-        if !self.has_active_copilot_suggestion(cx) {
-            self.refresh_copilot_suggestions(false, cx);
+    pub fn show_inline_completion(&mut self, _: &ShowInlineCompletion, cx: &mut ViewContext<Self>) {
+        if !self.has_active_inline_completion(cx) {
+            self.refresh_inline_completion(false, cx);
             return;
         }
 
-        self.update_visible_copilot_suggestion(cx);
+        self.update_visible_inline_completion(cx);
     }
 
     pub fn display_cursor_names(&mut self, _: &DisplayCursorNames, cx: &mut ViewContext<Self>) {
@@ -4078,48 +4222,43 @@ impl Editor {
         .detach();
     }
 
-    fn next_copilot_suggestion(&mut self, _: &copilot::NextSuggestion, cx: &mut ViewContext<Self>) {
-        if self.has_active_copilot_suggestion(cx) {
-            self.cycle_copilot_suggestions(Direction::Next, cx);
+    pub fn next_inline_completion(&mut self, _: &NextInlineCompletion, cx: &mut ViewContext<Self>) {
+        if self.has_active_inline_completion(cx) {
+            self.cycle_inline_completion(Direction::Next, cx);
         } else {
-            let is_copilot_disabled = self.refresh_copilot_suggestions(false, cx).is_none();
+            let is_copilot_disabled = self.refresh_inline_completion(false, cx).is_none();
             if is_copilot_disabled {
                 cx.propagate();
             }
         }
     }
 
-    fn previous_copilot_suggestion(
+    pub fn previous_inline_completion(
         &mut self,
-        _: &copilot::PreviousSuggestion,
+        _: &PreviousInlineCompletion,
         cx: &mut ViewContext<Self>,
     ) {
-        if self.has_active_copilot_suggestion(cx) {
-            self.cycle_copilot_suggestions(Direction::Prev, cx);
+        if self.has_active_inline_completion(cx) {
+            self.cycle_inline_completion(Direction::Prev, cx);
         } else {
-            let is_copilot_disabled = self.refresh_copilot_suggestions(false, cx).is_none();
+            let is_copilot_disabled = self.refresh_inline_completion(false, cx).is_none();
             if is_copilot_disabled {
                 cx.propagate();
             }
         }
     }
 
-    fn accept_copilot_suggestion(&mut self, cx: &mut ViewContext<Self>) -> bool {
-        if let Some(suggestion) = self.take_active_copilot_suggestion(cx) {
-            if let Some((copilot, completion)) =
-                Copilot::global(cx).zip(self.copilot_state.active_completion())
-            {
-                copilot
-                    .update(cx, |copilot, cx| copilot.accept_completion(completion, cx))
-                    .detach_and_log_err(cx);
-
-                self.report_copilot_event(Some(completion.uuid.clone()), true, cx)
+    fn accept_inline_completion(&mut self, cx: &mut ViewContext<Self>) -> bool {
+        if let Some(completion) = self.take_active_inline_completion(cx) {
+            if let Some(provider) = self.inline_completion_provider() {
+                provider.accept(cx);
             }
+
             cx.emit(EditorEvent::InputHandled {
                 utf16_range_to_replace: None,
-                text: suggestion.text.to_string().into(),
+                text: completion.text.to_string().into(),
             });
-            self.insert_with_autoindent_mode(&suggestion.text.to_string(), None, cx);
+            self.insert_with_autoindent_mode(&completion.text.to_string(), None, cx);
             cx.notify();
             true
         } else {
@@ -4127,21 +4266,21 @@ impl Editor {
         }
     }
 
-    fn accept_partial_copilot_suggestion(
+    pub fn accept_partial_inline_completion(
         &mut self,
-        _: &AcceptPartialCopilotSuggestion,
+        _: &AcceptPartialInlineCompletion,
         cx: &mut ViewContext<Self>,
     ) {
-        if self.selections.count() == 1 && self.has_active_copilot_suggestion(cx) {
-            if let Some(suggestion) = self.take_active_copilot_suggestion(cx) {
-                let mut partial_suggestion = suggestion
+        if self.selections.count() == 1 && self.has_active_inline_completion(cx) {
+            if let Some(completion) = self.take_active_inline_completion(cx) {
+                let mut partial_completion = completion
                     .text
                     .chars()
                     .by_ref()
                     .take_while(|c| c.is_alphabetic())
                     .collect::<String>();
-                if partial_suggestion.is_empty() {
-                    partial_suggestion = suggestion
+                if partial_completion.is_empty() {
+                    partial_completion = completion
                         .text
                         .chars()
                         .by_ref()
@@ -4151,111 +4290,92 @@ impl Editor {
 
                 cx.emit(EditorEvent::InputHandled {
                     utf16_range_to_replace: None,
-                    text: partial_suggestion.clone().into(),
+                    text: partial_completion.clone().into(),
                 });
-                self.insert_with_autoindent_mode(&partial_suggestion, None, cx);
-                self.refresh_copilot_suggestions(true, cx);
+                self.insert_with_autoindent_mode(&partial_completion, None, cx);
+                self.refresh_inline_completion(true, cx);
                 cx.notify();
             }
         }
     }
 
-    fn discard_copilot_suggestion(&mut self, cx: &mut ViewContext<Self>) -> bool {
-        if let Some(suggestion) = self.take_active_copilot_suggestion(cx) {
-            if let Some(copilot) = Copilot::global(cx) {
-                copilot
-                    .update(cx, |copilot, cx| {
-                        copilot.discard_completions(&self.copilot_state.completions, cx)
-                    })
-                    .detach_and_log_err(cx);
-
-                self.report_copilot_event(None, false, cx)
-            }
-
-            self.display_map.update(cx, |map, cx| {
-                map.splice_inlays(vec![suggestion.id], Vec::new(), cx)
-            });
-            cx.notify();
-            true
-        } else {
-            false
+    fn discard_inline_completion(&mut self, cx: &mut ViewContext<Self>) -> bool {
+        if let Some(provider) = self.inline_completion_provider() {
+            provider.discard(cx);
         }
+
+        self.take_active_inline_completion(cx).is_some()
     }
 
-    fn is_copilot_enabled_at(
-        &self,
-        location: Anchor,
-        snapshot: &MultiBufferSnapshot,
-        cx: &mut ViewContext<Self>,
-    ) -> bool {
-        let file = snapshot.file_at(location);
-        let language = snapshot.language_at(location);
-        let settings = all_language_settings(file, cx);
-        self.show_copilot_suggestions
-            && settings.copilot_enabled(language, file.map(|f| f.path().as_ref()))
-    }
-
-    fn has_active_copilot_suggestion(&self, cx: &AppContext) -> bool {
-        if let Some(suggestion) = self.copilot_state.suggestion.as_ref() {
+    pub fn has_active_inline_completion(&self, cx: &AppContext) -> bool {
+        if let Some(completion) = self.active_inline_completion.as_ref() {
             let buffer = self.buffer.read(cx).read(cx);
-            suggestion.position.is_valid(&buffer)
+            completion.position.is_valid(&buffer)
         } else {
             false
         }
     }
 
-    fn take_active_copilot_suggestion(&mut self, cx: &mut ViewContext<Self>) -> Option<Inlay> {
-        let suggestion = self.copilot_state.suggestion.take()?;
+    fn take_active_inline_completion(&mut self, cx: &mut ViewContext<Self>) -> Option<Inlay> {
+        let completion = self.active_inline_completion.take()?;
         self.display_map.update(cx, |map, cx| {
-            map.splice_inlays(vec![suggestion.id], Default::default(), cx);
+            map.splice_inlays(vec![completion.id], Default::default(), cx);
         });
         let buffer = self.buffer.read(cx).read(cx);
 
-        if suggestion.position.is_valid(&buffer) {
-            Some(suggestion)
+        if completion.position.is_valid(&buffer) {
+            Some(completion)
         } else {
             None
         }
     }
 
-    fn update_visible_copilot_suggestion(&mut self, cx: &mut ViewContext<Self>) {
-        let snapshot = self.buffer.read(cx).snapshot(cx);
+    fn update_visible_inline_completion(&mut self, cx: &mut ViewContext<Self>) {
         let selection = self.selections.newest_anchor();
         let cursor = selection.head();
 
-        if self.context_menu.read().is_some()
-            || !self.completion_tasks.is_empty()
-            || selection.start != selection.end
+        if self.context_menu.read().is_none()
+            && self.completion_tasks.is_empty()
+            && selection.start == selection.end
         {
-            self.discard_copilot_suggestion(cx);
-        } else if let Some(text) = self
-            .copilot_state
-            .text_for_active_completion(cursor, &snapshot)
-        {
-            let text = Rope::from(text);
-            let mut to_remove = Vec::new();
-            if let Some(suggestion) = self.copilot_state.suggestion.take() {
-                to_remove.push(suggestion.id);
-            }
+            if let Some(provider) = self.inline_completion_provider() {
+                if let Some((buffer, cursor_buffer_position)) =
+                    self.buffer.read(cx).text_anchor_for_position(cursor, cx)
+                {
+                    if let Some(text) =
+                        provider.active_completion_text(&buffer, cursor_buffer_position, cx)
+                    {
+                        let text = Rope::from(text);
+                        let mut to_remove = Vec::new();
+                        if let Some(completion) = self.active_inline_completion.take() {
+                            to_remove.push(completion.id);
+                        }
 
-            let suggestion_inlay =
-                Inlay::suggestion(post_inc(&mut self.next_inlay_id), cursor, text);
-            self.copilot_state.suggestion = Some(suggestion_inlay.clone());
-            self.display_map.update(cx, move |map, cx| {
-                map.splice_inlays(to_remove, vec![suggestion_inlay], cx)
-            });
-            cx.notify();
-        } else {
-            self.discard_copilot_suggestion(cx);
+                        let completion_inlay =
+                            Inlay::suggestion(post_inc(&mut self.next_inlay_id), cursor, text);
+                        self.active_inline_completion = Some(completion_inlay.clone());
+                        self.display_map.update(cx, move |map, cx| {
+                            map.splice_inlays(to_remove, vec![completion_inlay], cx)
+                        });
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
         }
+
+        self.discard_inline_completion(cx);
     }
 
-    fn clear_copilot_suggestions(&mut self, cx: &mut ViewContext<Self>) {
-        if let Some(old_suggestion) = self.copilot_state.suggestion.take() {
-            self.splice_inlays(vec![old_suggestion.id], Vec::new(), cx);
+    fn clear_inline_completion(&mut self, cx: &mut ViewContext<Self>) {
+        if let Some(old_completion) = self.active_inline_completion.take() {
+            self.splice_inlays(vec![old_completion.id], Vec::new(), cx);
         }
-        self.copilot_state = CopilotState::default();
-        self.discard_copilot_suggestion(cx);
+        self.discard_inline_completion(cx);
+    }
+
+    fn inline_completion_provider(&self) -> Option<Arc<dyn InlineCompletionProviderHandle>> {
+        Some(self.inline_completion_provider.as_ref()?.provider.clone())
     }
 
     pub fn render_code_actions_indicator(
@@ -4353,7 +4473,7 @@ impl Editor {
         self.completion_tasks.clear();
         let context_menu = self.context_menu.write().take();
         if context_menu.is_some() {
-            self.update_visible_copilot_suggestion(cx);
+            self.update_visible_inline_completion(cx);
         }
         context_menu
     }
@@ -4546,7 +4666,7 @@ impl Editor {
 
             this.change_selections(Some(Autoscroll::fit()), cx, |s| s.select(selections));
             this.insert("", cx);
-            this.refresh_copilot_suggestions(true, cx);
+            this.refresh_inline_completion(true, cx);
         });
     }
 
@@ -4564,7 +4684,7 @@ impl Editor {
                 })
             });
             this.insert("", cx);
-            this.refresh_copilot_suggestions(true, cx);
+            this.refresh_inline_completion(true, cx);
         });
     }
 
@@ -4626,13 +4746,13 @@ impl Editor {
                 }
             }
 
-            // Accept copilot suggestion if there is only one selection and the cursor is not
+            // Accept copilot completion if there is only one selection and the cursor is not
             // in the leading whitespace.
             if self.selections.count() == 1
                 && cursor.column >= current_indent.len
-                && self.has_active_copilot_suggestion(cx)
+                && self.has_active_inline_completion(cx)
             {
-                self.accept_copilot_suggestion(cx);
+                self.accept_inline_completion(cx);
                 return;
             }
 
@@ -4659,7 +4779,7 @@ impl Editor {
         self.transact(cx, |this, cx| {
             this.buffer.update(cx, |b, cx| b.edit(edits, None, cx));
             this.change_selections(Some(Autoscroll::fit()), cx, |s| s.select(selections));
-            this.refresh_copilot_suggestions(true, cx);
+            this.refresh_inline_completion(true, cx);
         });
     }
 
@@ -5293,7 +5413,7 @@ impl Editor {
         });
     }
 
-    pub fn duplicate_line(&mut self, action: &DuplicateLine, cx: &mut ViewContext<Self>) {
+    pub fn duplicate_line(&mut self, upwards: bool, cx: &mut ViewContext<Self>) {
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let buffer = &display_map.buffer_snapshot;
         let selections = self.selections.all::<Point>(cx);
@@ -5322,7 +5442,7 @@ impl Editor {
                 .text_for_range(start..end)
                 .chain(Some("\n"))
                 .collect::<String>();
-            let insert_location = if action.move_upwards {
+            let insert_location = if upwards {
                 Point::new(rows.end, 0)
             } else {
                 start
@@ -5337,6 +5457,14 @@ impl Editor {
 
             this.request_autoscroll(Autoscroll::fit(), cx);
         });
+    }
+
+    pub fn duplicate_line_up(&mut self, _: &DuplicateLineUp, cx: &mut ViewContext<Self>) {
+        self.duplicate_line(true, cx);
+    }
+
+    pub fn duplicate_line_down(&mut self, _: &DuplicateLineDown, cx: &mut ViewContext<Self>) {
+        self.duplicate_line(false, cx);
     }
 
     pub fn move_line_up(&mut self, _: &MoveLineUp, cx: &mut ViewContext<Self>) {
@@ -5753,7 +5881,7 @@ impl Editor {
             }
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(cx);
-            self.refresh_copilot_suggestions(true, cx);
+            self.refresh_inline_completion(true, cx);
             cx.emit(EditorEvent::Edited);
             cx.emit(EditorEvent::TransactionUndone {
                 transaction_id: tx_id,
@@ -5775,7 +5903,7 @@ impl Editor {
             }
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(cx);
-            self.refresh_copilot_suggestions(true, cx);
+            self.refresh_inline_completion(true, cx);
             cx.emit(EditorEvent::Edited);
         }
     }
@@ -7816,7 +7944,7 @@ impl Editor {
                         let range = target.range.to_offset(target.buffer.read(cx));
                         let range = editor.range_for_match(&range);
                         if Some(&target.buffer) == editor.buffer.read(cx).as_singleton().as_ref() {
-                            editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
+                            editor.change_selections(Some(Autoscroll::focused()), cx, |s| {
                                 s.select_ranges([range]);
                             });
                         } else {
@@ -7836,7 +7964,7 @@ impl Editor {
                                     // to avoid creating a history entry at the previous cursor location.
                                     pane.update(cx, |pane, _| pane.disable_history());
                                     target_editor.change_selections(
-                                        Some(Autoscroll::fit()),
+                                        Some(Autoscroll::focused()),
                                         cx,
                                         |s| {
                                             s.select_ranges([range]);
@@ -8436,14 +8564,17 @@ impl Editor {
         cx: &mut ViewContext<Self>,
     ) -> Task<Result<()>> {
         let buffer = self.buffer().clone();
-        let buffers = buffer.read(cx).all_buffers();
+        let mut buffers = buffer.read(cx).all_buffers();
+        if trigger == FormatTrigger::Save {
+            buffers.retain(|buffer| buffer.read(cx).is_dirty());
+        }
 
         let mut timeout = cx.background_executor().timer(FORMAT_TIMEOUT).fuse();
         let format = project.update(cx, |project, cx| project.format(buffers, true, trigger, cx));
 
         cx.spawn(|_, mut cx| async move {
             let transaction = futures::select_biased! {
-                _ = timeout => {
+                () = timeout => {
                     log::warn!("timed out waiting for formatting");
                     None
                 }
@@ -8991,9 +9122,42 @@ impl Editor {
         }
     }
 
-    fn get_permalink_to_line(&mut self, cx: &mut ViewContext<Self>) -> Result<url::Url> {
-        use git::permalink::{build_permalink, BuildPermalinkParams};
+    pub fn toggle_git_blame(&mut self, _: &ToggleGitBlame, cx: &mut ViewContext<Self>) {
+        if !self.show_git_blame {
+            if let Err(error) = self.show_git_blame_internal(cx) {
+                log::error!("failed to toggle on 'git blame': {}", error);
+                return;
+            }
+            self.show_git_blame = true
+        } else {
+            self.blame_subscription.take();
+            self.blame.take();
+            self.show_git_blame = false
+        }
 
+        cx.notify();
+    }
+
+    fn show_git_blame_internal(&mut self, cx: &mut ViewContext<Self>) -> Result<()> {
+        if let Some(project) = self.project.as_ref() {
+            let Some(buffer) = self.buffer().read(cx).as_singleton() else {
+                anyhow::bail!("git blame not available in multi buffers")
+            };
+
+            let project = project.clone();
+            let blame = cx.new_model(|cx| GitBlame::new(buffer, project, cx));
+            self.blame_subscription = Some(cx.observe(&blame, |_, _, cx| cx.notify()));
+            self.blame = Some(blame);
+        }
+
+        Ok(())
+    }
+
+    pub fn blame(&self) -> Option<&Model<GitBlame>> {
+        self.blame.as_ref()
+    }
+
+    fn get_permalink_to_line(&mut self, cx: &mut ViewContext<Self>) -> Result<url::Url> {
         let (path, repo) = maybe!({
             let project_handle = self.project.as_ref()?.clone();
             let project = project_handle.read(cx);
@@ -9026,7 +9190,12 @@ impl Editor {
             remote_url: &origin_url,
             sha: &sha,
             path: &path,
-            selection: selection.map(|selection| selection.range()),
+            selection: selection.map(|selection| {
+                let range = selection.range();
+                let start = range.start.row;
+                let end = range.end.row;
+                start..end
+            }),
         })
     }
 
@@ -9444,8 +9613,8 @@ impl Editor {
             } => {
                 self.refresh_active_diagnostics(cx);
                 self.refresh_code_actions(cx);
-                if self.has_active_copilot_suggestion(cx) {
-                    self.update_visible_copilot_suggestion(cx);
+                if self.has_active_inline_completion(cx) {
+                    self.update_visible_inline_completion(cx);
                 }
                 cx.emit(EditorEvent::BufferEdited);
                 cx.emit(SearchEvent::MatchesInvalidated);
@@ -9479,7 +9648,9 @@ impl Editor {
                     }
                 }
 
-                let Some(project) = &self.project else { return };
+                let Some(project) = &self.project else {
+                    return;
+                };
                 let telemetry = project.read(cx).client().telemetry().clone();
                 telemetry.log_edit_event("editor");
             }
@@ -9523,7 +9694,7 @@ impl Editor {
     }
 
     fn settings_changed(&mut self, cx: &mut ViewContext<Self>) {
-        self.refresh_copilot_suggestions(true, cx);
+        self.refresh_inline_completion(true, cx);
         self.refresh_inlay_hints(
             InlayHintRefreshReason::SettingsChange(inlay_hint_settings(
                 self.selections.newest_anchor().head(),
@@ -9609,6 +9780,7 @@ impl Editor {
         path: ProjectPath,
         position: Point,
         anchor: language::Anchor,
+        offset_from_top: u32,
         cx: &mut ViewContext<Self>,
     ) {
         let workspace = self.workspace();
@@ -9636,9 +9808,13 @@ impl Editor {
                 };
 
                 let nav_history = editor.nav_history.take();
-                editor.change_selections(Some(Autoscroll::newest()), cx, |s| {
-                    s.select_ranges([cursor..cursor]);
-                });
+                editor.change_selections(
+                    Some(Autoscroll::top_relative(offset_from_top as usize)),
+                    cx,
+                    |s| {
+                        s.select_ranges([cursor..cursor]);
+                    },
+                );
                 editor.nav_history = nav_history;
 
                 anyhow::Ok(())
@@ -9685,29 +9861,6 @@ impl Editor {
                     ..snapshot.clip_offset_utf16(selection.end, Bias::Right)
             })
             .collect()
-    }
-
-    fn report_copilot_event(
-        &self,
-        suggestion_id: Option<String>,
-        suggestion_accepted: bool,
-        cx: &AppContext,
-    ) {
-        let Some(project) = &self.project else { return };
-
-        // If None, we are either getting suggestions in a new, unsaved file, or in a file without an extension
-        let file_extension = self
-            .buffer
-            .read(cx)
-            .as_singleton()
-            .and_then(|b| b.read(cx).file())
-            .and_then(|file| Path::new(file.file_name(cx)).extension())
-            .and_then(|e| e.to_str())
-            .map(|a| a.to_string());
-
-        let telemetry = project.read(cx).client().telemetry().clone();
-
-        telemetry.report_copilot_event(suggestion_id, suggestion_accepted, file_extension)
     }
 
     fn report_editor_event(
@@ -10160,7 +10313,12 @@ impl EditorSnapshot {
             0.0.into()
         };
 
-        let left_padding = if gutter_settings.code_actions {
+        let git_blame_entries_width = self
+            .show_git_blame
+            .then_some(em_width * GIT_BLAME_GUTTER_WIDTH_CHARS);
+
+        let mut left_padding = git_blame_entries_width.unwrap_or(Pixels::ZERO);
+        left_padding += if gutter_settings.code_actions {
             em_width * 3.0
         } else if show_git_gutter && gutter_settings.line_numbers {
             em_width * 2.0
@@ -10185,6 +10343,7 @@ impl EditorSnapshot {
             right_padding,
             width: line_gutter_width + left_padding + right_padding,
             margin: -descent,
+            git_blame_entries_width,
         }
     }
 }
@@ -10691,6 +10850,41 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
         let mut text_style = cx.text_style().clone();
         text_style.color = diagnostic_style(diagnostic.severity, true, cx.theme().status());
 
+        let multi_line_diagnostic = diagnostic.message.contains('\n');
+
+        let buttons = |diagnostic: &Diagnostic, block_id: usize| {
+            if multi_line_diagnostic {
+                v_flex()
+            } else {
+                h_flex()
+            }
+            .children(diagnostic.is_primary.then(|| {
+                IconButton::new(("close-block", block_id), IconName::XCircle)
+                    .icon_color(Color::Muted)
+                    .size(ButtonSize::Compact)
+                    .style(ButtonStyle::Transparent)
+                    .visible_on_hover(group_id.clone())
+                    .on_click(move |_click, cx| cx.dispatch_action(Box::new(Cancel)))
+                    .tooltip(|cx| Tooltip::for_action("Close Diagnostics", &Cancel, cx))
+            }))
+            .child(
+                IconButton::new(("copy-block", block_id), IconName::Copy)
+                    .icon_color(Color::Muted)
+                    .size(ButtonSize::Compact)
+                    .style(ButtonStyle::Transparent)
+                    .visible_on_hover(group_id.clone())
+                    .on_click({
+                        let message = diagnostic.message.clone();
+                        move |_click, cx| cx.write_to_clipboard(ClipboardItem::new(message.clone()))
+                    })
+                    .tooltip(|cx| Tooltip::text("Copy diagnostic message", cx)),
+            )
+        };
+
+        let icon_size = buttons(&diagnostic, cx.block_id)
+            .into_any_element()
+            .measure(AvailableSpace::min_size(), cx);
+
         h_flex()
             .id(cx.block_id)
             .group(group_id.clone())
@@ -10701,9 +10895,10 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
             .child(
                 div()
                     .flex()
-                    .w(cx.anchor_x - cx.gutter_dimensions.width)
+                    .w(cx.anchor_x - cx.gutter_dimensions.width - icon_size.width)
                     .flex_shrink(),
             )
+            .child(buttons(&diagnostic, cx.block_id))
             .child(div().flex().flex_shrink_0().child(
                 StyledText::new(text_without_backticks.clone()).with_highlights(
                     &text_style,
@@ -10718,18 +10913,6 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
                     }),
                 ),
             ))
-            .child(
-                IconButton::new(("copy-block", cx.block_id), IconName::Copy)
-                    .icon_color(Color::Muted)
-                    .size(ButtonSize::Compact)
-                    .style(ButtonStyle::Transparent)
-                    .visible_on_hover(group_id)
-                    .on_click({
-                        let message = diagnostic.message.clone();
-                        move |_click, cx| cx.write_to_clipboard(ClipboardItem::new(message.clone()))
-                    })
-                    .tooltip(|cx| Tooltip::text("Copy diagnostic message", cx)),
-            )
             .into_any_element()
     })
 }

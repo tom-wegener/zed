@@ -12,7 +12,7 @@ use futures::StreamExt;
 use rand::{prelude::StdRng, Rng, SeedableRng};
 use rpc::{
     proto::{self},
-    ConnectionId,
+    ConnectionId, ExtensionMetadata,
 };
 use sea_orm::{
     entity::prelude::*,
@@ -21,11 +21,13 @@ use sea_orm::{
     FromQueryResult, IntoActiveModel, IsolationLevel, JoinType, QueryOrder, QuerySelect, Statement,
     TransactionTrait,
 };
-use serde::{ser::Error as _, Deserialize, Serialize, Serializer};
+use semantic_version::SemanticVersion;
+use serde::{Deserialize, Serialize};
 use sqlx::{
     migrate::{Migrate, Migration, MigrationSource},
     Connection,
 };
+use std::ops::RangeInclusive;
 use std::{
     fmt::Write as _,
     future::Future,
@@ -36,7 +38,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use time::{format_description::well_known::iso8601, PrimitiveDateTime};
+use time::PrimitiveDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[cfg(test)]
@@ -126,12 +128,6 @@ impl Database {
         }
 
         Ok(new_migrations)
-    }
-
-    /// Initializes static data that resides in the database by upserting it.
-    pub async fn initialize_static_data(&mut self) -> Result<()> {
-        self.initialize_notification_kinds().await?;
-        Ok(())
     }
 
     /// Transaction runs things in a transaction. If you want to call other methods
@@ -731,36 +727,12 @@ pub struct NewExtensionVersion {
     pub description: String,
     pub authors: Vec<String>,
     pub repository: String,
+    pub schema_version: i32,
+    pub wasm_api_version: Option<String>,
     pub published_at: PrimitiveDateTime,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
-pub struct ExtensionMetadata {
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub authors: Vec<String>,
-    pub description: String,
-    pub repository: String,
-    #[serde(serialize_with = "serialize_iso8601")]
-    pub published_at: PrimitiveDateTime,
-    pub download_count: u64,
-}
-
-pub fn serialize_iso8601<S: Serializer>(
-    datetime: &PrimitiveDateTime,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    const SERDE_CONFIG: iso8601::EncodedConfig = iso8601::Config::DEFAULT
-        .set_year_is_six_digits(false)
-        .set_time_precision(iso8601::TimePrecision::Second {
-            decimal_digits: None,
-        })
-        .encode();
-
-    datetime
-        .assume_utc()
-        .format(&time::format_description::well_known::Iso8601::<SERDE_CONFIG>)
-        .map_err(S::Error::custom)?
-        .serialize(serializer)
+pub struct ExtensionVersionConstraints {
+    pub schema_versions: RangeInclusive<i32>,
+    pub wasm_api_versions: RangeInclusive<SemanticVersion>,
 }

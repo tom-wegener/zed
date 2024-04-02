@@ -1,8 +1,8 @@
 use crate::{
     ActiveTooltip, AnyTooltip, AnyView, Bounds, DispatchPhase, Element, ElementContext, ElementId,
-    HighlightStyle, Hitbox, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, SharedString, Size, TextRun, TextStyle, WhiteSpace, WindowContext, WrappedLine,
-    TOOLTIP_DELAY,
+    HighlightStyle, Hitbox, IntoElement, LayoutId, LineLayout, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, SharedString, Size, TextRun, TextStyle, WhiteSpace, WindowContext,
+    WrappedLine, TOOLTIP_DELAY,
 };
 use anyhow::anyhow;
 use parking_lot::{Mutex, MutexGuard};
@@ -118,6 +118,12 @@ impl StyledText {
         }
     }
 
+    /// Sets the text for this [`StyledText`].
+    pub fn with_text(mut self, text: impl Into<SharedString>) -> Self {
+        self.text = text.into();
+        self
+    }
+
     /// Set the styling attributes for the given text, as well as
     /// as any ranges of text that have had their style customized.
     pub fn with_highlights(
@@ -144,6 +150,18 @@ impl StyledText {
         }
         self.runs = Some(runs);
         self
+    }
+
+    /// Lays out this line of [`StyledText`] at the specified font size.
+    pub fn layout_line(
+        &self,
+        font_size: Pixels,
+        cx: &WindowContext,
+    ) -> anyhow::Result<Arc<LineLayout>> {
+        let Some(runs) = self.runs.as_ref() else {
+            return Err(anyhow!("must pass runs"));
+        };
+        cx.text_system().layout_line(&self.text, font_size, runs)
     }
 }
 
@@ -415,8 +433,26 @@ impl Element for InteractiveText {
         state: &mut Self::BeforeLayout,
         cx: &mut ElementContext,
     ) -> Hitbox {
-        self.text.after_layout(bounds, state, cx);
-        cx.insert_hitbox(bounds, false)
+        cx.with_element_state::<InteractiveTextState, _>(
+            Some(self.element_id.clone()),
+            |interactive_state, cx| {
+                let interactive_state = interactive_state
+                    .map(|interactive_state| interactive_state.unwrap_or_default());
+
+                if let Some(interactive_state) = interactive_state.as_ref() {
+                    if let Some(active_tooltip) = interactive_state.active_tooltip.borrow().as_ref()
+                    {
+                        if let Some(tooltip) = active_tooltip.tooltip.clone() {
+                            cx.set_tooltip(tooltip);
+                        }
+                    }
+                }
+
+                self.text.after_layout(bounds, state, cx);
+                let hitbox = cx.insert_hitbox(bounds, false);
+                (hitbox, interactive_state)
+            },
+        )
     }
 
     fn paint(
@@ -557,16 +593,6 @@ impl Element for InteractiveText {
                     cx.on_mouse_event(move |_: &MouseDownEvent, _, _| {
                         active_tooltip.take();
                     });
-
-                    if let Some(tooltip) = interactive_state
-                        .active_tooltip
-                        .clone()
-                        .borrow()
-                        .as_ref()
-                        .and_then(|at| at.tooltip.clone())
-                    {
-                        cx.set_tooltip(tooltip);
-                    }
                 }
 
                 self.text.paint(bounds, text_state, &mut (), cx);

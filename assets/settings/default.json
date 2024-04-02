@@ -48,7 +48,8 @@
   // which gives the same size as all other panes.
   "active_pane_magnification": 1.0,
   // The key to use for adding multiple cursors
-  // Currently "alt" or "cmd" are supported.
+  // Currently "alt" or "cmd_or_ctrl"  (also aliased as
+  // "cmd" and "ctrl") are supported.
   "multi_cursor_modifier": "alt",
   // Whether to enable vim modes and key bindings
   "vim_mode": false,
@@ -245,6 +246,8 @@
   "assistant": {
     // Version of this setting.
     "version": "1",
+    // Whether the assistant is enabled.
+    "enabled": true,
     // Whether to show the assistant panel button in the status bar.
     "button": true,
     // Where to dock the assistant panel. Can be 'left', 'right' or 'bottom'.
@@ -558,6 +561,9 @@
         "source.organizeImports": true
       }
     },
+    "Make": {
+      "hard_tabs": true
+    },
     "Markdown": {
       "tab_size": 2,
       "soft_wrap": "preferred_line_length"
@@ -584,6 +590,9 @@
       "tab_size": 2
     },
     "OCaml Interface": {
+      "tab_size": 2
+    },
+    "Prisma": {
       "tab_size": 2
     }
   },
