@@ -876,10 +876,8 @@ impl EditorElement {
                         block_width = em_width;
                     }
                     let block_text = if let CursorShape::Block = selection.cursor_shape {
-                        snapshot
-                            .chars_at(cursor_position)
-                            .next()
-                            .and_then(|(character, _)| {
+                        snapshot.display_chars_at(cursor_position).next().and_then(
+                            |(character, _)| {
                                 let text = if character == '\n' {
                                     SharedString::from(" ")
                                 } else {
@@ -900,7 +898,8 @@ impl EditorElement {
                                         }],
                                     )
                                     .log_err()
-                            })
+                            },
+                        )
                     } else {
                         None
                     };
@@ -2909,17 +2908,14 @@ fn render_blame_entry(
     let pretty_commit_id = format!("{}", blame_entry.sha);
     let short_commit_id = pretty_commit_id.clone().chars().take(6).collect::<String>();
 
-    let name = blame_entry.author.as_deref().unwrap_or("<no name>");
-    let name = if name.len() > 20 {
-        format!("{}...", &name[..16])
-    } else {
-        name.to_string()
-    };
+    let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
+    let name = util::truncate_and_trailoff(author_name, 20);
 
     let permalink = blame.read(cx).permalink_for_entry(&blame_entry);
     let commit_message = blame.read(cx).message_for_entry(&blame_entry);
 
     h_flex()
+        .w_full()
         .font(text_style.font().family)
         .line_height(text_style.line_height)
         .id(("blame", ix))
@@ -2929,8 +2925,12 @@ fn render_blame_entry(
                 .child(short_commit_id)
                 .mr_2(),
             div()
+                .w_full()
+                .h_flex()
+                .justify_between()
                 .text_color(cx.theme().status().hint)
-                .child(format!("{:20} {: >14}", name, relative_timestamp)),
+                .child(name)
+                .child(relative_timestamp),
         ])
         .on_mouse_down(MouseButton::Right, {
             let blame_entry = blame_entry.clone();

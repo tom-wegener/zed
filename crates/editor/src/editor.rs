@@ -64,12 +64,11 @@ use gpui::{
     AnyElement, AppContext, AsyncWindowContext, AvailableSpace, BackgroundExecutor, Bounds,
     ClipboardItem, Context, DispatchPhase, ElementId, EventEmitter, FocusHandle, FocusableView,
     FontId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText, KeyContext, Model,
-    MouseButton, ParentElement, Pixels, Render, SharedString, Styled, StyledText, Subscription,
-    Task, TextStyle, UnderlineStyle, UniformListScrollHandle, View, ViewContext, ViewInputHandler,
-    VisualContext, WeakView, WhiteSpace, WindowContext,
+    MouseButton, ParentElement, Pixels, Render, SharedString, StrikethroughStyle, Styled,
+    StyledText, Subscription, Task, TextStyle, UnderlineStyle, UniformListScrollHandle, View,
+    ViewContext, ViewInputHandler, VisualContext, WeakView, WhiteSpace, WindowContext,
 };
 use highlight_matching_bracket::refresh_matching_bracket_highlights;
-use hover_links::{HoverLink, HoveredLinkState, InlayHighlight};
 use hover_popover::{hide_hover, HoverState};
 use inlay_hint_cache::{InlayHintCache, InlaySplice, InvalidationStrategy};
 pub use inline_completion_provider::*;
@@ -82,6 +81,8 @@ use language::{
     CodeLabel, Completion, CursorShape, Diagnostic, Documentation, IndentKind, IndentSize,
     Language, OffsetRangeExt, Point, Selection, SelectionGoal, TransactionId,
 };
+
+use hover_links::{HoverLink, HoveredLinkState, InlayHighlight};
 use lsp::{DiagnosticSeverity, LanguageServerId};
 use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
@@ -124,7 +125,7 @@ use ui::{
     h_flex, prelude::*, ButtonSize, ButtonStyle, IconButton, IconName, IconSize, ListItem, Popover,
     Tooltip,
 };
-use util::{maybe, post_inc, RangeExt, ResultExt, TryFutureExt};
+use util::{defer, maybe, post_inc, RangeExt, ResultExt, TryFutureExt};
 use workspace::Toast;
 use workspace::{
     searchable::SearchEvent, ItemNavHistory, SplitDirection, ViewId, Workspace, WorkspaceId,
@@ -860,41 +861,25 @@ impl CompletionsMenu {
         let settings = EditorSettings::get_global(cx);
         let show_completion_documentation = settings.show_completion_documentation;
 
-        let font_size = style.text.font_size.to_pixels(cx.rem_size());
-        let padding_width = cx.rem_size().0 / 16. * 36.;
-
-        let max_completion_len = px(510.);
-        let widest_completion_pixels = self
+        let widest_completion_ix = self
             .matches
             .iter()
-            .map(|mat| {
+            .enumerate()
+            .max_by_key(|(_, mat)| {
                 let completions = self.completions.read();
                 let completion = &completions[mat.candidate_id];
                 let documentation = &completion.documentation;
 
-                let mut len = completion.label.text.chars().count() as f32;
-                if let Ok(text_width) = cx.text_system().layout_line(
-                    completion.label.text.as_str(),
-                    font_size,
-                    &[style.text.to_run(completion.label.text.as_str().len())],
-                ) {
-                    len = text_width.width.0;
-                }
-
-                if let Some(Documentation::SingleLine(documentation_text)) = documentation {
+                let mut len = completion.label.text.chars().count();
+                if let Some(Documentation::SingleLine(text)) = documentation {
                     if show_completion_documentation {
-                        if let Ok(documentation_width) = cx.text_system().layout_line(
-                            documentation_text.as_str(),
-                            font_size,
-                            &[style.text.to_run(documentation_text.as_str().len())],
-                        ) {
-                            len = documentation_width.width.0 + padding_width;
-                        }
+                        len += text.chars().count();
                     }
                 }
-                (len + padding_width).min(max_completion_len.0 as f32)
+
+                len
             })
-            .fold(190_f32, |a, b| a.max(b));
+            .map(|(ix, _)| ix);
 
         let completions = self.completions.clone();
         let matches = self.matches.clone();
@@ -948,7 +933,7 @@ impl CompletionsMenu {
                     .map(|(ix, mat)| {
                         let item_ix = start_ix + ix;
                         let candidate_id = mat.candidate_id;
-                        let completion = completions_guard[candidate_id].clone();
+                        let completion = &completions_guard[candidate_id];
 
                         let documentation = if show_completion_documentation {
                             &completion.documentation
@@ -956,36 +941,63 @@ impl CompletionsMenu {
                             &None
                         };
 
-                        let (_completion_width, completion_label, documentation_label) =
-                            Self::truncate_completion(
-                                &style,
-                                cx,
-                                mat,
-                                &mut completion.clone(),
-                                documentation,
-                                max_completion_len,
-                            );
-                        div()
-                            .min_w(px(widest_completion_pixels + padding_width))
-                            .max_w(max_completion_len + px(padding_width))
-                            .child(
-                                ListItem::new(mat.candidate_id)
-                                    .inset(true)
-                                    .selected(item_ix == selected_item)
-                                    .on_click(cx.listener(move |editor, _event, cx| {
-                                        cx.stop_propagation();
-                                        if let Some(task) = editor.confirm_completion(
-                                            &ConfirmCompletion {
-                                                item_ix: Some(item_ix),
-                                            },
-                                            cx,
-                                        ) {
-                                            task.detach_and_log_err(cx)
-                                        }
-                                    }))
-                                    .child(h_flex().overflow_hidden().child(completion_label))
-                                    .end_slot(documentation_label),
-                            )
+                        let highlights = gpui::combine_highlights(
+                            mat.ranges().map(|range| (range, FontWeight::BOLD.into())),
+                            styled_runs_for_code_label(&completion.label, &style.syntax).map(
+                                |(range, mut highlight)| {
+                                    // Ignore font weight for syntax highlighting, as we'll use it
+                                    // for fuzzy matches.
+                                    highlight.font_weight = None;
+
+                                    if completion.lsp_completion.deprecated.unwrap_or(false) {
+                                        highlight.strikethrough = Some(StrikethroughStyle {
+                                            thickness: 1.0.into(),
+                                            ..Default::default()
+                                        });
+                                        highlight.color = Some(cx.theme().colors().text_muted);
+                                    }
+
+                                    (range, highlight)
+                                },
+                            ),
+                        );
+                        let completion_label = StyledText::new(completion.label.text.clone())
+                            .with_highlights(&style.text, highlights);
+                        let documentation_label =
+                            if let Some(Documentation::SingleLine(text)) = documentation {
+                                if text.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        h_flex().ml_4().child(
+                                            Label::new(text.clone())
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                    )
+                                }
+                            } else {
+                                None
+                            };
+
+                        div().min_w(px(220.)).max_w(px(540.)).child(
+                            ListItem::new(mat.candidate_id)
+                                .inset(true)
+                                .selected(item_ix == selected_item)
+                                .on_click(cx.listener(move |editor, _event, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(task) = editor.confirm_completion(
+                                        &ConfirmCompletion {
+                                            item_ix: Some(item_ix),
+                                        },
+                                        cx,
+                                    ) {
+                                        task.detach_and_log_err(cx)
+                                    }
+                                }))
+                                .child(h_flex().overflow_hidden().child(completion_label))
+                                .end_slot::<Div>(documentation_label),
+                        )
                     })
                     .collect()
             },
@@ -993,7 +1005,7 @@ impl CompletionsMenu {
         .occlude()
         .max_h(max_height)
         .track_scroll(self.scroll_handle.clone())
-        .min_w(px(widest_completion_pixels + padding_width));
+        .with_width_from_item(widest_completion_ix);
 
         Popover::new()
             .child(list)
@@ -1001,294 +1013,6 @@ impl CompletionsMenu {
                 popover.aside(multiline_docs)
             })
             .into_any_element()
-    }
-
-    fn truncate_completion(
-        style: &EditorStyle,
-        cx: &mut ViewContext<Editor>,
-        mat: &StringMatch,
-        completion: &mut Completion,
-        documentation: &Option<Documentation>,
-        max_completion_len: Pixels,
-    ) -> (Pixels, StyledText, StyledText) {
-        let highlights = gpui::combine_highlights(
-            mat.ranges().map(|range| (range, FontWeight::BOLD.into())),
-            styled_runs_for_code_label(&completion.label, &style.syntax).map(
-                |(range, mut highlight)| {
-                    // Ignore font weight for syntax highlighting, as we'll use it
-                    // for fuzzy matches.
-                    highlight.font_weight = None;
-                    (range, highlight)
-                },
-            ),
-        );
-
-        let mut inline_documentation_exists = false;
-
-        let mut documentation_text = if let Some(Documentation::SingleLine(text)) = documentation {
-            inline_documentation_exists = true;
-            text
-        } else {
-            ""
-        }
-        .to_owned();
-        let documentation_style = style.clone().text;
-
-        let documentation_highlight_style = HighlightStyle {
-            color: Some(Color::Muted.color(cx)),
-            ..Default::default()
-        };
-
-        let documentation_highlights = vec![(
-            Range {
-                start: 0,
-                end: documentation_text.len(),
-            },
-            documentation_highlight_style,
-        )];
-        let documentation_label = StyledText::new(documentation_text.clone())
-            .with_highlights(&documentation_style, documentation_highlights);
-
-        let mut completion_label =
-            StyledText::new(completion.label.text.clone()).with_highlights(&style.text, highlights);
-
-        let font_size = style.text.font_size.to_pixels(cx.rem_size());
-
-        let mut variable_name_end = completion.label.filter_range.end;
-        let mut completion_label_text = completion.label.text.clone();
-        let mut variable_name_length_truncated: i32 = 0;
-
-        let mut actual_width: Pixels = px(0.);
-        if let Ok(ellipsis_width) =
-            cx.text_system()
-                .layout_line("…", font_size, &[style.text.to_run("…".len())])
-        {
-            if let Ok(completion_layout_line) = completion_label.layout_line(font_size, cx) {
-                if let Ok(documentation_layout_line) =
-                    documentation_label.layout_line(font_size, cx)
-                {
-                    if inline_documentation_exists {
-                        if completion_layout_line.width + documentation_layout_line.width
-                            > max_completion_len
-                        {
-                            actual_width = max_completion_len;
-                            let width_of_variable_name = completion_layout_line
-                                .x_for_index(completion.label.filter_range.end);
-                            let width_of_documentation =
-                                documentation_layout_line.x_for_index(documentation_text.len());
-
-                            let max_width_of_variable_name =
-                                if width_of_documentation < max_completion_len * 0.2 {
-                                    max_completion_len - width_of_documentation
-                                } else {
-                                    max_completion_len * 0.8
-                                };
-
-                            if width_of_variable_name < max_width_of_variable_name {
-                                // Only truncate the second part.
-                                if let Some(documentation_truncation_index) =
-                                    documentation_layout_line.index_for_x(
-                                        (max_completion_len * 0.65).min(
-                                            max_completion_len
-                                                - ellipsis_width.width
-                                                - width_of_variable_name,
-                                        ),
-                                    )
-                                {
-                                    variable_name_end = documentation_truncation_index + 2;
-                                    documentation_text = documentation_text
-                                        .chars()
-                                        .take(documentation_truncation_index)
-                                        .collect::<String>()
-                                        + "…";
-                                }
-                            } else {
-                                // Truncate the first part (and optionally the second part).
-                                if let Some(variable_name_truncation_index) = completion_layout_line
-                                    .index_for_x(max_width_of_variable_name - ellipsis_width.width)
-                                {
-                                    variable_name_end = variable_name_truncation_index + 2;
-                                    variable_name_length_truncated =
-                                        completion.label.filter_range.end as i32
-                                            - variable_name_end as i32
-                                            - 1;
-                                    completion_label_text = completion
-                                        .label
-                                        .text
-                                        .chars()
-                                        .take(variable_name_truncation_index)
-                                        .collect::<String>()
-                                        + "…";
-                                    completion_label =
-                                        completion_label.with_text(completion_label_text.clone());
-                                    if let Ok(new_completion_layout_line) =
-                                        completion_label.layout_line(font_size, cx)
-                                    {
-                                        let combined_width = new_completion_layout_line
-                                            .x_for_index(completion_label_text.len())
-                                            + width_of_documentation;
-                                        if combined_width > max_completion_len {
-                                            if let Some(documentation_truncation_index) =
-                                                documentation_layout_line.index_for_x(
-                                                    (max_completion_len * 0.65).min(
-                                                        max_completion_len
-                                                            - ellipsis_width.width
-                                                            - max_width_of_variable_name,
-                                                    ),
-                                                )
-                                            {
-                                                documentation_text = documentation_text
-                                                    .chars()
-                                                    .take(documentation_truncation_index)
-                                                    .collect::<String>()
-                                                    + "…";
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            actual_width =
-                                completion_layout_line.width + documentation_layout_line.width;
-                        }
-                    } else {
-                        if completion_layout_line.width > max_completion_len {
-                            actual_width = max_completion_len;
-                            let width_of_variable_name = completion_layout_line
-                                .x_for_index(completion.label.filter_range.end);
-                            let width_of_type_annotation =
-                                completion_layout_line.width - width_of_variable_name;
-
-                            let max_width_of_variable_name =
-                                if width_of_type_annotation < max_completion_len * 0.2 {
-                                    max_completion_len - width_of_type_annotation
-                                } else {
-                                    max_completion_len * 0.8
-                                };
-
-                            if width_of_variable_name < max_width_of_variable_name {
-                                // Only truncate the second part.
-
-                                if let Some(type_annotation_truncation_index) =
-                                    completion_layout_line
-                                        .index_for_x(max_completion_len - ellipsis_width.width)
-                                {
-                                    completion_label_text = completion
-                                        .label
-                                        .text
-                                        .chars()
-                                        .take(type_annotation_truncation_index)
-                                        .collect::<String>()
-                                        + "…";
-                                }
-                            } else {
-                                // Truncate the first part (and optionally the second part).
-                                if let Some(variable_name_truncation_index) = completion_layout_line
-                                    .index_for_x(max_width_of_variable_name - ellipsis_width.width)
-                                {
-                                    variable_name_end = variable_name_truncation_index + 2;
-
-                                    variable_name_length_truncated =
-                                        completion.label.filter_range.end as i32
-                                            - variable_name_end as i32
-                                            - 1;
-
-                                    let second_part_text = &completion.label.text.as_str()
-                                        [completion.label.filter_range.end..];
-
-                                    completion_label_text = completion
-                                        .label
-                                        .text
-                                        .chars()
-                                        .take(variable_name_truncation_index)
-                                        .collect::<String>()
-                                        + "…"
-                                        + second_part_text;
-                                    completion_label =
-                                        completion_label.with_text(completion_label_text.clone());
-
-                                    if let Ok(layout_line) =
-                                        completion_label.layout_line(font_size, cx)
-                                    {
-                                        let combined_width =
-                                            layout_line.x_for_index(completion_label_text.len());
-                                        if combined_width > max_completion_len {
-                                            if let Some(type_annotation_truncation_index) =
-                                                layout_line.index_for_x(
-                                                    max_completion_len - ellipsis_width.width,
-                                                )
-                                            {
-                                                completion_label_text = completion_label_text
-                                                    .chars()
-                                                    .take(type_annotation_truncation_index - 2)
-                                                    .collect::<String>()
-                                                    + "…";
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            actual_width = completion_layout_line.width;
-                        }
-                    }
-                }
-            }
-        };
-
-        // Recompute syntax highlighting.
-        completion.label.text = completion_label_text.clone();
-        if inline_documentation_exists {
-            completion.label.filter_range.end = completion_label_text.len();
-            for run in completion.label.runs.iter_mut() {
-                if run.0.start == 0 {
-                    run.0.start = 0;
-                    run.0.end = completion_label_text.len();
-                }
-            }
-        } else {
-            completion.label.filter_range.end = variable_name_end;
-            for run in completion.label.runs.iter_mut() {
-                if run.0.start == 0 {
-                    run.0.start = 0;
-                    run.0.end = variable_name_end;
-                } else {
-                    run.0.start = (run.0.start as i32 - variable_name_length_truncated) as usize;
-                    run.0.end = (run.0.end as i32 - variable_name_length_truncated) as usize;
-                }
-            }
-        }
-        let highlights = gpui::combine_highlights(
-            mat.ranges().map(|range| (range, FontWeight::NORMAL.into())),
-            styled_runs_for_code_label(&completion.label, &style.syntax).map(
-                |(range, mut highlight)| {
-                    // Ignore font weight for syntax highlighting, as we'll use it
-                    // for fuzzy matches.
-                    highlight.font_weight = None;
-                    (range, highlight)
-                },
-            ),
-        );
-
-        let completion_label =
-            StyledText::new(completion_label_text).with_highlights(&style.text, highlights);
-
-        let documentation_style = style.clone().text;
-        let documentation_highlight_style = HighlightStyle {
-            color: Some(Color::Muted.color(cx)),
-            ..Default::default()
-        };
-        let documentation_highlights = vec![(
-            Range {
-                start: 0,
-                end: documentation_text.len(),
-            },
-            documentation_highlight_style,
-        )];
-
-        let documentation_label = StyledText::new(documentation_text)
-            .with_highlights(&documentation_style, documentation_highlights);
-        (actual_width, completion_label, documentation_label)
     }
 
     pub async fn filter(&mut self, query: Option<&str>, executor: BackgroundExecutor) {
@@ -3578,7 +3302,7 @@ impl Editor {
             .text_anchor_for_position(position, cx)?;
 
         // OnTypeFormatting returns a list of edits, no need to pass them between Zed instances,
-        // hence we do LSP request & edit on host side only — add formats to host's history.
+        // hence we do LSP request & edit on host side only — add formats to host's history.
         let push_to_lsp_host_history = true;
         // If this is not the host, append its history with new edits.
         let push_to_client_history = project.read(cx).is_remote();
@@ -4845,6 +4569,7 @@ impl Editor {
         }
 
         let mut delta_for_end_row = 0;
+        let has_multiple_rows = start_row + 1 != end_row;
         for row in start_row..end_row {
             let current_indent = snapshot.indent_size_for_line(row);
             let indent_delta = match (current_indent.kind, indent_kind) {
@@ -4856,7 +4581,12 @@ impl Editor {
                 (_, IndentKind::Tab) => IndentSize::tab(),
             };
 
-            let row_start = Point::new(row, 0);
+            let start = if has_multiple_rows || current_indent.len < selection.start.column {
+                0
+            } else {
+                selection.start.column
+            };
+            let row_start = Point::new(row, start);
             edits.push((
                 row_start..row_start,
                 indent_delta.chars().collect::<String>(),
@@ -4902,7 +4632,7 @@ impl Editor {
                         rows.start += 1;
                     }
                 }
-
+                let has_multiple_rows = rows.len() > 1;
                 for row in rows {
                     let indent_size = snapshot.indent_size_for_line(row);
                     if indent_size.len > 0 {
@@ -4917,7 +4647,16 @@ impl Editor {
                             }
                             IndentKind::Tab => 1,
                         };
-                        deletion_ranges.push(Point::new(row, 0)..Point::new(row, deletion_len));
+                        let start = if has_multiple_rows
+                            || deletion_len > selection.start.column
+                            || indent_size.len < selection.start.column
+                        {
+                            0
+                        } else {
+                            selection.start.column - deletion_len
+                        };
+                        deletion_ranges
+                            .push(Point::new(row, start)..Point::new(row, start + deletion_len));
                         last_outdent = Some(row);
                     }
                 }
@@ -8114,9 +7853,10 @@ impl Editor {
                 Bias::Left
             },
         );
+
         match self
             .find_all_references_task_sources
-            .binary_search_by(|task_anchor| task_anchor.cmp(&head_anchor, &multi_buffer_snapshot))
+            .binary_search_by(|anchor| anchor.cmp(&head_anchor, &multi_buffer_snapshot))
         {
             Ok(_) => {
                 log::info!(
@@ -8134,66 +7874,27 @@ impl Editor {
         let workspace = self.workspace()?;
         let project = workspace.read(cx).project().clone();
         let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
-        let open_task = cx.spawn(|editor, mut cx| async move {
-            let mut locations = references.await?;
-            let snapshot = buffer.update(&mut cx, |buffer, _| buffer.snapshot())?;
-            let head_offset = text::ToOffset::to_offset(&head, &snapshot);
-
-            // LSP may return references that contain the item itself we requested `find_all_references` for (eg. rust-analyzer)
-            // So we will remove it from locations
-            // If there is only one reference, we will not do this filter cause it may make locations empty
-            if locations.len() > 1 {
-                cx.update(|cx| {
-                    locations.retain(|location| {
-                        // fn foo(x : i64) {
-                        //         ^
-                        //  println!(x);
-                        // }
-                        // It is ok to find reference when caret being at ^ (the end of the word)
-                        // So we turn offset into inclusive to include the end of the word
-                        !location
-                            .range
-                            .to_offset(location.buffer.read(cx))
-                            .to_inclusive()
-                            .contains(&head_offset)
-                    });
-                })?;
-            }
-
-            if locations.is_empty() {
-                return Ok(());
-            }
-
-            // If there is one reference, just open it directly
-            if locations.len() == 1 {
-                let target = locations.pop().unwrap();
-
-                return editor.update(&mut cx, |editor, cx| {
-                    let range = target.range.to_offset(target.buffer.read(cx));
-                    let range = editor.range_for_match(&range);
-
-                    if Some(&target.buffer) == editor.buffer().read(cx).as_singleton().as_ref() {
-                        editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                            s.select_ranges([range]);
-                        });
-                    } else {
-                        cx.window_context().defer(move |cx| {
-                            let target_editor: View<Self> =
-                                workspace.update(cx, |workspace, cx| {
-                                    workspace.open_project_item(
-                                        workspace.active_pane().clone(),
-                                        target.buffer.clone(),
-                                        cx,
-                                    )
-                                });
-                            target_editor.update(cx, |target_editor, cx| {
-                                target_editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                                    s.select_ranges([range]);
+        Some(cx.spawn(|editor, mut cx| async move {
+            let _cleanup = defer({
+                let mut cx = cx.clone();
+                move || {
+                    let _ = editor.update(&mut cx, |editor, _| {
+                        if let Ok(i) =
+                            editor
+                                .find_all_references_task_sources
+                                .binary_search_by(|anchor| {
+                                    anchor.cmp(&head_anchor, &multi_buffer_snapshot)
                                 })
-                            })
-                        })
-                    }
-                });
+                        {
+                            editor.find_all_references_task_sources.remove(i);
+                        }
+                    });
+                }
+            });
+
+            let locations = references.await?;
+            if locations.is_empty() {
+                return anyhow::Ok(());
             }
 
             workspace.update(&mut cx, |workspace, cx| {
@@ -8213,24 +7914,7 @@ impl Editor {
                 Self::open_locations_in_multibuffer(
                     workspace, locations, replica_id, title, false, cx,
                 );
-            })?;
-
-            Ok(())
-        });
-        Some(cx.spawn(|editor, mut cx| async move {
-            open_task.await?;
-            editor.update(&mut cx, |editor, _| {
-                if let Ok(i) =
-                    editor
-                        .find_all_references_task_sources
-                        .binary_search_by(|task_anchor| {
-                            task_anchor.cmp(&head_anchor, &multi_buffer_snapshot)
-                        })
-                {
-                    editor.find_all_references_task_sources.remove(i);
-                }
-            })?;
-            anyhow::Ok(())
+            })
         }))
     }
 
@@ -9648,9 +9332,7 @@ impl Editor {
                     }
                 }
 
-                let Some(project) = &self.project else {
-                    return;
-                };
+                let Some(project) = &self.project else { return };
                 let telemetry = project.read(cx).client().telemetry().clone();
                 telemetry.log_edit_event("editor");
             }
