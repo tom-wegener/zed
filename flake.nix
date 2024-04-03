@@ -65,6 +65,17 @@
       };
     });
 
+    packages = eachSystem (
+      pkgs: {
+        default = rustToolchain.buildRustPackage {
+          pname = "Zed";
+          src = ./.;
+
+          cargoLock = {lockFile = ./Cargo.lock;};
+        };
+      }
+    );
+
     formatter = eachSystem (pkgs: treefmtEval.${pkgs.system}.config.build.wrapper);
 
     checks = eachSystem (pkgs: {
